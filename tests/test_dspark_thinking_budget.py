@@ -250,3 +250,30 @@ class TestDraftGenDoesNotCount:
             f"draft-gen leaked {delta} into the budget counter "
             f"(speculative drafts must not count until emitted)"
         )
+
+
+class TestDraftGenNearBudget:
+    """Drafts skip the budget processor only while it can't act: within the
+    chain's reach of the budget, the drafts must still carry the forced
+    close-think token, as the emitted tokens will."""
+
+    def _drafts(self, budget: int):
+        proc = _make_budget_processor(budget)
+        batch, _cache, buf = _make_batch(proc, emitted=10, k=2)
+        state = _make_state(2, [FILL, FILL], 10)
+        buf.update_and_fetch(mx.array([5], dtype=mx.uint32))
+        proc(buf.tokens, _logits_for([FILL]))  # one emitted thinking token
+        hidden = mx.zeros((1, 1, 8), dtype=mx.float32)
+        committed = mx.array([5], dtype=mx.uint32)
+        bg._chain_next_drafts(batch, state, hidden, committed, buf.tokens)
+        return state.drafts.tolist(), proc
+
+    def test_budget_within_reach_forces_the_first_draft(self):
+        drafts, proc = self._drafts(budget=2)
+        assert drafts[0] == CLOSE
+        assert proc._thinking_tokens == 1  # drafts still don't count
+
+    def test_budget_out_of_reach_leaves_drafts_alone(self):
+        drafts, proc = self._drafts(budget=10_000)
+        assert drafts == [FILL, FILL]
+        assert proc._thinking_tokens == 1

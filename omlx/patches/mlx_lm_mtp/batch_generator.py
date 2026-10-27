@@ -1698,6 +1698,22 @@ def _apply_processors(processors, prev_tokens, logits_2d):
     return logits_2d
 
 
+def _draft_processors(procs, positions: int):
+    """The processors that can change a draft's logits within ``positions`` steps.
+
+    Draft steps rewind processor state afterwards, so a processor that
+    declares itself inert for those steps (the thinking budget, far from its
+    budget) is skipped. Calling it anyway reads the draft tokens back from
+    the GPU each step, which stalls the draft loop.
+    """
+    if not procs:
+        return procs
+    live = [
+        p for p in procs if not (hasattr(p, "inert_for") and p.inert_for(positions))
+    ]
+    return live or None
+
+
 def _snap_snapshotable(procs):
     """Checkpoint state of processors exposing ``snapshot_state`` (budget).
 
@@ -3146,18 +3162,20 @@ def _dspark_next_drafts(
     # Drafts are speculative — processor calls shape the draft
     # distribution but must not advance the thinking budget (they would
     # count tokens that are only emitted if verified later). Checkpoint
-    # before the loop and rewind after.
-    snap = _snap_snapshotable(procs)
+    # before the loop and rewind after. Processors inert for the whole
+    # chain are skipped (see _draft_processors).
+    draft_procs = _draft_processors(procs, depth)
+    snap = _snap_snapshotable(draft_procs)
 
     for idx in range(depth):
         bias, _ = host.dspark_markov(previous)
         logits_2d = logits[:, idx, :] + bias
-        if procs is not None and prev_buf is not None:
+        if draft_procs is not None and prev_buf is not None:
             prefix = mx.concatenate(
                 [prev_buf.astype(mx.int32), anchor.reshape(1).astype(mx.int32)]
                 + [token.reshape(1).astype(mx.int32) for token in draft_toks]
             )
-            logits_2d = _apply_processors(procs, prefix, logits_2d)
+            logits_2d = _apply_processors(draft_procs, prefix, logits_2d)
         lp_2d = _logprobs(logits_2d)
         token = _ensure_uint32(sampler(lp_2d))
         draft_toks.append(token)
@@ -3165,7 +3183,7 @@ def _dspark_next_drafts(
         draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
         previous = token.reshape(1)
 
-    _restore_snapshotable(procs, snap)
+    _restore_snapshotable(draft_procs, snap)
 
     state.drafts = mx.concatenate(draft_toks)
     state.draft_lps = draft_lps
@@ -3271,7 +3289,8 @@ def _chain_next_drafts(
         chain_cache = _chain_tail_caches(model, state.mtp_cache) or chain_cache
 
     # Speculative draft shaping — see _dspark_next_drafts.
-    snap = _snap_snapshotable(procs)
+    draft_procs = _draft_processors(procs, depth)
+    snap = _snap_snapshotable(draft_procs)
 
     sparse_ids: List[Any] = []
     for j in range(depth):
@@ -3283,12 +3302,12 @@ def _chain_next_drafts(
             sparse_ids.append(mx.take(cand_ids.reshape(-1), ids))
         else:
             logits_2d = logits[:, -1, :]
-            if procs is not None and prev_buf is not None:
+            if draft_procs is not None and prev_buf is not None:
                 prev = mx.concatenate(
                     [prev_buf.astype(mx.int32), chain_prefix.astype(mx.int32)]
                     + [t.reshape(1).astype(mx.int32) for t in draft_toks]
                 )
-                logits_2d = _apply_processors(procs, prev, logits_2d)
+                logits_2d = _apply_processors(draft_procs, prev, logits_2d)
             lp_2d = _logprobs(logits_2d)
             if sparse_k:
                 tok, ids, accept_lp = _sample_draft_sparse(sampler, lp_2d, sparse_k)
@@ -3314,7 +3333,7 @@ def _chain_next_drafts(
             source, head_hidden = coarse.hidden(h, tok.reshape(1, 1), chain_cache)
         h = head_hidden[:, -1:]
 
-    _restore_snapshotable(procs, snap)
+    _restore_snapshotable(draft_procs, snap)
 
     if draft_toks:
         state.drafts = mx.concatenate(draft_toks)
@@ -3506,13 +3525,16 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
     mtp_logits = gen_batch.model.mtp_forward(hidden_at_main, next_ids, mtp_cache)
     mtp_logits_2d = mtp_logits[:, -1, :]
     # The seed draft is speculative — shape but do not count.
-    snap = _snap_snapshotable(procs)
-    if procs is not None:
+    draft_procs = _draft_processors(procs, 1)
+    snap = _snap_snapshotable(draft_procs)
+    if draft_procs is not None:
         prev_with_main_and_next = mx.concatenate(
             [prev_buf, _ensure_uint32(next_main_tok)]
         )
-        mtp_logits_2d = _apply_processors(procs, prev_with_main_and_next, mtp_logits_2d)
-    _restore_snapshotable(procs, snap)
+        mtp_logits_2d = _apply_processors(
+            draft_procs, prev_with_main_and_next, mtp_logits_2d
+        )
+    _restore_snapshotable(draft_procs, snap)
     draft_lp_2d = _logprobs(mtp_logits_2d)
     draft_tok = sampler(draft_lp_2d)
     # Filtered draft lp — what the sampler actually drew from. The next
@@ -5038,11 +5060,12 @@ def _step_mtp(
     )
     mtp_logits_2d = mtp_logits[:, -1, :]
     # The draft is speculative — shape it but do not advance the budget.
-    snap = _snap_snapshotable(procs)
-    if procs is not None and prev_buf is not None:
+    draft_procs = _draft_processors(procs, 1)
+    snap = _snap_snapshotable(draft_procs)
+    if draft_procs is not None and prev_buf is not None:
         prev_with_next = mx.concatenate([prev_buf, _ensure_uint32(next_main_tok)])
-        mtp_logits_2d = _apply_processors(procs, prev_with_next, mtp_logits_2d)
-    _restore_snapshotable(procs, snap)
+        mtp_logits_2d = _apply_processors(draft_procs, prev_with_next, mtp_logits_2d)
+    _restore_snapshotable(draft_procs, snap)
     new_lp = _logprobs(mtp_logits_2d)
     new_tok = sampler(new_lp)
     # Filtered draft lp — what the sampler actually drew from. The next
