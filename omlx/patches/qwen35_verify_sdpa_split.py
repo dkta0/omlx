@@ -400,9 +400,10 @@ def _wide_causal_sdpa(queries, keys, values, scale):
 
 
 # Verify blocks through Metal 4 tensor ops: one threadgroup per KV head and
-# key split holds the rows of every query head in its group, so each 64-key
-# block is read once for the whole group. M_ is the fused row count: the
-# block's q_len x G rows rounded up to a multiple of 8, not a fixed 8 x G.
+# key split holds the rows of every query head in its group, so each key
+# block (N_ keys) is read once for the whole group. M_ is the fused row count:
+# the block's q_len x G rows rounded up to a multiple of 8, not a fixed 8 x G.
+# TPR_ threads share a fused row in the softmax (TPR_ x M_ <= 256).
 _GQA_HEADER = """
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
@@ -410,8 +411,8 @@ using namespace mpp::tensor_ops;
 
 _GQA_PARTIAL = """
     constexpr int D = 256;
-    constexpr int N = 64;
-    constexpr int KPL = N / 4;
+    constexpr int N = N_;
+    constexpr int KPL = N / TPR_;
     constexpr int M = M_;
     uint tid = thread_position_in_threadgroup.x;
     int h = int(threadgroup_position_in_grid.x);
@@ -459,10 +460,10 @@ _GQA_PARTIAL = """
         if (running.is_valid_element(i))
             running[i] = 0.0f;
 
-    // Fused row f is query row f / G of query head h * G + f % G; four
+    // Fused row f is query row f / G of query head h * G + f % G; TPR_
     // threads own a row, KPL keys each.
-    int f = int(tid) / 4;
-    int col = (int(tid) % 4) * KPL;
+    int f = int(tid) / TPR_;
+    int col = (int(tid) % TPR_) * KPL;
     for (int t0 = t_begin; t0 < t_end; t0 += N) {
         int ts = min(t0, T - N);
         auto ks = tensor(kh + ts * kst, dextents<int, 2>{D, N}, array<int, 2>{1, kst})
@@ -484,8 +485,8 @@ _GQA_PARTIAL = """
                 sv[j] = ok ? scores[f * N + col + j] * scale : -INFINITY;
                 lmax = max(lmax, sv[j]);
             }
-            lmax = max(lmax, simd_shuffle_xor(lmax, ushort(1)));
-            lmax = max(lmax, simd_shuffle_xor(lmax, ushort(2)));
+            for (ushort o = 1; o < TPR_; o <<= 1)
+                lmax = max(lmax, simd_shuffle_xor(lmax, o));
             float pmax = row_max[f];
             float nmax = max(pmax, lmax);
             float lsum = 0.0f;
@@ -494,8 +495,8 @@ _GQA_PARTIAL = """
                 lsum += p;
                 probs[f * N + col + j] = T_(p);
             }
-            lsum += simd_shuffle_xor(lsum, ushort(1));
-            lsum += simd_shuffle_xor(lsum, ushort(2));
+            for (ushort o = 1; o < TPR_; o <<= 1)
+                lsum += simd_shuffle_xor(lsum, o);
             if (col == 0) {
                 float a = (nmax == -INFINITY || nmax == pmax) ? 1.0f : exp(pmax - nmax);
                 row_scale[f] = a;
@@ -644,9 +645,14 @@ def _gqa_causal_sdpa(queries, keys, values, scale):
         ("KVH", kv_heads),
         ("M_", fused_rows),
     ]
+    # Past 16k keys, blocks of up to 32 fused rows take 128-key blocks with 8
+    # threads per row: half the barriers per key and no idle softmax threads
+    # (M3 Ultra: 1.11-1.16x at 5 rows, 32k-128k keys). Wider blocks would
+    # overflow threadgroup memory; shorter caches measured slower (0.95x at 8k).
+    wide = kv_len > 16384 and fused_rows <= 32 and not _m1_gpu()
     o_part, ml_part = _GQA_KERNELS["partial"](
         inputs=[fused, keys, values, params],
-        template=template,
+        template=template + [("N_", 128 if wide else 64), ("TPR_", 8 if wide else 4)],
         grid=(kv_heads * 256, n_splits, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[
