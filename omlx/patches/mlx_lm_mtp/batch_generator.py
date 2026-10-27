@@ -1698,13 +1698,14 @@ def _apply_processors(processors, prev_tokens, logits_2d):
     return logits_2d
 
 
-def _draft_processors(procs, positions: int):
-    """The processors that can change a draft's logits within ``positions`` steps.
+def _live_processors(procs, positions: int):
+    """The processors that can change logits within the next ``positions`` calls.
 
-    Draft steps rewind processor state afterwards, so a processor that
-    declares itself inert for those steps (the thinking budget, far from its
-    budget) is skipped. Calling it anyway reads the draft tokens back from
-    the GPU each step, which stalls the draft loop.
+    A processor that declares itself inert for those calls (the thinking
+    budget, far from its budget) is left out. Draft steps rewind processor
+    state afterwards, and verify rows only advance it, so calling an inert
+    processor there just reads the tokens back from the GPU at every step,
+    which stalls the MTP cycle.
     """
     if not procs:
         return procs
@@ -1712,6 +1713,39 @@ def _draft_processors(procs, positions: int):
         p for p in procs if not (hasattr(p, "inert_for") and p.inert_for(positions))
     ]
     return live or None
+
+
+class _HostTokens:
+    """Token history whose tail past ``base`` is host ints.
+
+    Processors read only ``len()`` and the positions they haven't accepted
+    yet, which all lie in the tail, so they can advance without a GPU read.
+    """
+
+    def __init__(self, base: int, tail: List[int]):
+        self._base = base
+        self._tail = tail
+
+    def __len__(self) -> int:
+        return self._base + len(self._tail)
+
+    def __getitem__(self, i: int) -> int:
+        if i < self._base:
+            raise IndexError(f"position {i} precedes the host tail at {self._base}")
+        return self._tail[i - self._base]
+
+
+def _advance_processors(procs, base: int, emitted: List[int]) -> None:
+    """Advance inert processors over the tokens emitted this cycle.
+
+    One call per emitted position, as the verify rows would have made, with
+    the history read from host ints. The processors are inert for these
+    positions, so the logits argument is never touched.
+    """
+    for j in range(len(emitted)):
+        history = _HostTokens(base, emitted[: j + 1])
+        for proc in procs:
+            proc(history, None)
 
 
 def _snap_snapshotable(procs):
@@ -3163,8 +3197,8 @@ def _dspark_next_drafts(
     # distribution but must not advance the thinking budget (they would
     # count tokens that are only emitted if verified later). Checkpoint
     # before the loop and rewind after. Processors inert for the whole
-    # chain are skipped (see _draft_processors).
-    draft_procs = _draft_processors(procs, depth)
+    # chain are skipped (see _live_processors).
+    draft_procs = _live_processors(procs, depth)
     snap = _snap_snapshotable(draft_procs)
 
     for idx in range(depth):
@@ -3289,7 +3323,7 @@ def _chain_next_drafts(
         chain_cache = _chain_tail_caches(model, state.mtp_cache) or chain_cache
 
     # Speculative draft shaping — see _dspark_next_drafts.
-    draft_procs = _draft_processors(procs, depth)
+    draft_procs = _live_processors(procs, depth)
     snap = _snap_snapshotable(draft_procs)
 
     sparse_ids: List[Any] = []
@@ -3525,7 +3559,7 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
     mtp_logits = gen_batch.model.mtp_forward(hidden_at_main, next_ids, mtp_cache)
     mtp_logits_2d = mtp_logits[:, -1, :]
     # The seed draft is speculative — shape but do not count.
-    draft_procs = _draft_processors(procs, 1)
+    draft_procs = _live_processors(procs, 1)
     snap = _snap_snapshotable(draft_procs)
     if draft_procs is not None:
         prev_with_main_and_next = mx.concatenate(
@@ -4389,11 +4423,18 @@ def _run_verify_cycle_chain(
     # Token buffer per input position (mirrors PR 990 _step_backbone). Row j's
     # processor prefix is everything before that input position.
     prev_rows: List[Optional[Any]] = [None] * (k + 1)
+    rows_from = 0
     if procs is not None:
         buf = gen_batch._token_context[0]
+        rows_from = buf._size
         prev_rows[0] = buf.update_and_fetch(state.next_main)
         for j in range(k):
             prev_rows[j + 1] = buf.update_and_fetch(state.drafts[j : j + 1])
+    # Processors that can't change any row's logits skip the rows; once the
+    # accept count is known they advance over the emitted tokens from host
+    # ids instead (_advance_processors).
+    verify_procs = _live_processors(procs, k + 1)
+    deferred_procs = [p for p in procs or [] if p not in (verify_procs or [])]
 
     # --- backbone verify forward + single host sync ---
     t0 = time.perf_counter()
@@ -4412,17 +4453,19 @@ def _run_verify_cycle_chain(
     state.stats.backbone_ms += verify_ms
     rows = logits[0]  # (k+1, vocab)
     row_snaps: List[Optional[Any]] = [None] * (k + 1)
-    if procs is not None:
+    if verify_procs is not None:
         applied = []
         for j in range(k + 1):
             applied.append(
-                _apply_processors(procs, prev_rows[j], rows[j : j + 1]).squeeze(0)
+                _apply_processors(verify_procs, prev_rows[j], rows[j : j + 1]).squeeze(
+                    0
+                )
             )
             # Checkpoint after each row: rows 0..m correspond to the m+1
             # tokens actually emitted this cycle (m accepted drafts + the
             # bonus/verify correction). Rows m+1..k are speculative — they
             # predict rejected drafts and are re-verified next cycle.
-            row_snaps[j] = _snap_snapshotable(procs)
+            row_snaps[j] = _snap_snapshotable(verify_procs)
         rows = mx.stack(applied)
     combined_lp = rows - mx.logsumexp(rows, axis=-1, keepdims=True)  # (k+1, V)
     # A block drafter can start the next block on the GPU while the host
@@ -4569,7 +4612,12 @@ def _run_verify_cycle_chain(
     # MTPProcessingSampler's position-keyed snapshot/restore on vlm_mtp.
     # Uses the FINAL m (after the model clamp and boundary alignment above).
     if m < k and row_snaps[m] is not None:
-        _restore_snapshotable(procs, row_snaps[m])
+        _restore_snapshotable(verify_procs, row_snaps[m])
+    if deferred_procs:
+        # Rows 0..m consumed next_main and the m accepted drafts.
+        emitted_ids = [int(state.next_main.reshape(-1)[0].item())]
+        emitted_ids += [int(d) for d in draft_ids[:m]]
+        _advance_processors(deferred_procs, rows_from, emitted_ids)
 
     # A clamp can put the final verify token on the boundary, while a full
     # accept can put its bonus token there. Neither token is present in the
@@ -5060,7 +5108,7 @@ def _step_mtp(
     )
     mtp_logits_2d = mtp_logits[:, -1, :]
     # The draft is speculative — shape it but do not advance the budget.
-    draft_procs = _draft_processors(procs, 1)
+    draft_procs = _live_processors(procs, 1)
     snap = _snap_snapshotable(draft_procs)
     if draft_procs is not None and prev_buf is not None:
         prev_with_next = mx.concatenate([prev_buf, _ensure_uint32(next_main_tok)])
