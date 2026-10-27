@@ -277,3 +277,26 @@ class TestDraftGenNearBudget:
         drafts, proc = self._drafts(budget=10_000)
         assert drafts == [FILL, FILL]
         assert proc._thinking_tokens == 1
+
+
+class TestVerifyRowsFarFromBudget:
+    """Far from its budget the processor skips the verify rows and advances
+    over the emitted tokens afterwards; it must still see them all."""
+
+    def test_close_think_among_accepted_drafts_ends_thinking(self, monkeypatch):
+        proc = _make_budget_processor(10_000)
+        emitted, delta = _run_cycle(
+            monkeypatch, proc, emitted=10, k=2, accept_m=2, draft_ids=[FILL, CLOSE]
+        )
+        assert emitted == 3
+        assert proc._done
+        assert not proc._in_thinking
+
+    def test_rejected_drafts_are_not_seen(self, monkeypatch):
+        proc = _make_budget_processor(10_000)
+        emitted, delta = _run_cycle(
+            monkeypatch, proc, emitted=10, k=2, accept_m=0, draft_ids=[CLOSE, FILL]
+        )
+        assert emitted == 1
+        assert not proc._done  # the rejected CLOSE draft never happened
+        assert proc._in_thinking

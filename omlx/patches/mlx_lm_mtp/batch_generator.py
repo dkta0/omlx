@@ -3292,7 +3292,11 @@ def _chain_next_drafts(
     if begin is not None:
         begin(state.mtp_cache, depth)
 
-    sparse_k = _sparse_top_k(sampler) if procs is None else 0
+    # Only processors that can act on this chain shape the drafts (see
+    # _live_processors); without any, the drafts take the top-k sampling
+    # and coarse-head paths a processor-free request gets.
+    draft_procs = _live_processors(procs, depth)
+    sparse_k = _sparse_top_k(sampler) if draft_procs is None else 0
     coarse = _coarse_draft_head(model) if 0 < sparse_k <= 32 else None
     n = committed.shape[0]
     if coarse is None:
@@ -3323,7 +3327,6 @@ def _chain_next_drafts(
         chain_cache = _chain_tail_caches(model, state.mtp_cache) or chain_cache
 
     # Speculative draft shaping — see _dspark_next_drafts.
-    draft_procs = _live_processors(procs, depth)
     snap = _snap_snapshotable(draft_procs)
 
     sparse_ids: List[Any] = []
